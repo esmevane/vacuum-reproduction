@@ -1,0 +1,25 @@
+[package]
+name = "vacuum-reproduction"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqlx = { version = "0.7.3", features = [
+  "sqlite",
+  "uuid",
+  "tls-rustls",
+  "chrono",
+  "runtime-tokio",
+] }
+tempfile = "3"
+rusqlite = { version = "*", features = ["bundled"] }
+tokio = { version = "1.37.0", features = ["full"] }
+tracing = { version = "0.1.40", features = ["log"] }
+tracing-test = "0.1"
+tracing-subscriber = { version = "0.3.18", features = [
+  "chrono",
+  "json",
+  "env-filter",
+  "serde",
+  "serde_json",
+] }
