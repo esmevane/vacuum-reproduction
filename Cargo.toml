@@ -15,7 +15,7 @@ tempfile = "3"
 rusqlite = { version = "*", features = ["bundled"] }
 tokio = { version = "1.37.0", features = ["full"] }
 tracing = { version = "0.1.40", features = ["log"] }
-tracing-test = "0.1"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tracing-subscriber = { version = "0.3.18", features = [
   "chrono",
   "json",
