@@ -1,10 +1,9 @@
+use std::{fmt::Debug, str::FromStr};
+
 use sqlx::{ConnectOptions, Executor};
-use std::{path::PathBuf, str::FromStr};
-use tempfile::tempdir;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tempfile::NamedTempFile;
 use tracing_test::traced_test;
 
-static DEFAULT_ENV_FILTER: &str = "info,sqlx=trace,rusqlite=trace";
 static CREATE_TABLE: &str = r#"
   create table test (id integer primary key, name text);
   insert into test (name) values ('hello');
@@ -19,25 +18,20 @@ struct Test {
     name: String,
 }
 
-#[tracing::instrument(level = "debug", name = "Creating temp db and ensuring it exists")]
-fn ensure_temp_dir_for_test_db_target_path_buffer() -> PathBuf {
-    let new_db = tempdir().unwrap().path().join("new.db");
-
-    tracing::info!(name: "Temp db location", ?new_db);
-
-    std::fs::create_dir_all(new_db.parent().unwrap()).unwrap();
-
-    new_db
+#[derive(Debug, sqlx::FromRow)]
+struct Table {
+    name: String,
 }
 
 #[tracing::instrument(level = "debug", name = "Creating vacuum statement")]
-fn vacuum_into(new_db: &str) -> String {
-    dbg!(format!("vacuum into '{}'", new_db))
+fn vacuum_into(db_str: &str) -> String {
+    dbg!(format!("vacuum into '{db_str}'"))
 }
 
 #[tracing::instrument(level = "debug", name = "Running sqlx with shared cache connection")]
-async fn sqlx_with_shared_cache_connection() -> Result<bool, Box<dyn std::error::Error>> {
-    let new_db = ensure_temp_dir_for_test_db_target_path_buffer();
+async fn sqlx_with_shared_cache_connection() -> anyhow::Result<()> {
+    let new_db = NamedTempFile::new()?;
+    let db_path: &str = new_db.as_ref().as_os_str().try_into()?;
 
     tracing::info!(name = "Creating connection with shared cache");
     let mut conn = sqlx::sqlite::SqliteConnectOptions::from_str(":memory:")?
@@ -55,26 +49,47 @@ async fn sqlx_with_shared_cache_connection() -> Result<bool, Box<dyn std::error:
 
     assert_eq!(things.len(), 2);
 
-    let vacuum_statement = vacuum_into(new_db.to_str().unwrap());
+    let vacuum_statement = vacuum_into(db_path);
 
-    tracing::info!(
-        name = "Vacuuming into new db",
-        path = new_db.to_str().unwrap()
-    );
+    tracing::info!(name = "Vacuuming into new db", path = db_path);
     conn.execute(vacuum_statement.as_ref()).await?;
 
     tracing::info!(name = "Dropping connection");
     drop(conn);
 
     tracing::info!(name = "Checking if new db exists");
+    assert!(new_db.as_ref().exists());
 
-    Ok(new_db.exists())
+    let pool = sqlx::sqlite::SqlitePool::connect(db_path).await?;
+
+    tracing::info!(name = "Checking if tables exist");
+    let tables = dbg!(
+        sqlx::query_as::<_, Table>("SELECT name FROM sqlite_master WHERE type='table'")
+            .fetch_all(&pool)
+            .await?
+    );
+
+    tracing::info!(name = "Current tables", ?tables);
+
+    assert!(tables.len() >= 1, "No tables found in new db");
+
+    tracing::info!(name = "Selecting all data from temp db");
+    let stored_things = sqlx::query_as::<_, Test>(SELECT_ALL)
+        .fetch_all(&pool)
+        .await?;
+
+    assert_eq!(stored_things.len(), 2);
+
+    tracing::info!(name = "Comparing stored rows with original rows");
+    assert_eq!(stored_things, things);
+
+    Ok(())
 }
 
 #[tracing::instrument(level = "debug", name = "Running sqlx with pooled connection")]
-async fn sqlx_with_pooled_connection() -> Result<bool, Box<dyn std::error::Error>> {
-    let new_db = ensure_temp_dir_for_test_db_target_path_buffer();
-
+async fn sqlx_with_pooled_connection() -> anyhow::Result<()> {
+    let new_db = NamedTempFile::new()?;
+    let db_path: &str = new_db.as_ref().as_os_str().try_into()?;
     tracing::info!(name = "Creating pool with shared cache");
     let options = sqlx::sqlite::SqliteConnectOptions::from_str(":memory:")?.shared_cache(true);
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -92,12 +107,9 @@ async fn sqlx_with_pooled_connection() -> Result<bool, Box<dyn std::error::Error
 
     assert_eq!(things.len(), 2);
 
-    let vacuum_statement = vacuum_into(new_db.to_str().unwrap());
+    let vacuum_statement = vacuum_into(db_path);
 
-    tracing::info!(
-        name = "Vacuuming into new db",
-        path = new_db.to_str().unwrap()
-    );
+    tracing::info!(name = "Vacuuming into new db", path = db_path);
     pool.execute(vacuum_statement.as_ref()).await?;
 
     tracing::info!(name = "Dropping pool");
@@ -105,13 +117,39 @@ async fn sqlx_with_pooled_connection() -> Result<bool, Box<dyn std::error::Error
 
     tracing::info!(name = "Checking if new db exists");
 
-    Ok(new_db.exists())
+    assert!(new_db.as_ref().exists());
+
+    tracing::info!(name = "Opening new db connection to temp db path");
+    let pool = sqlx::sqlite::SqlitePool::connect(db_path).await?;
+
+    tracing::info!(name = "Checking if tables exist");
+    let tables = dbg!(
+        sqlx::query_as::<_, Table>("SELECT name FROM sqlite_master WHERE type='table'")
+            .fetch_all(&pool)
+            .await?
+    );
+
+    tracing::info!(name = "Current tables", ?tables);
+
+    assert!(tables.len() >= 1, "No tables found in new db");
+
+    tracing::info!(name = "Selecting all data from temp db");
+    let stored_things = sqlx::query_as::<_, Test>(SELECT_ALL)
+        .fetch_all(&pool)
+        .await?;
+
+    assert_eq!(stored_things.len(), 2);
+
+    tracing::info!(name = "Comparing stored rows with original rows");
+    assert_eq!(stored_things, things);
+
+    Ok(())
 }
 
 #[tracing::instrument(level = "debug", name = "Running rusqlite")]
-async fn rusqlite() -> Result<(), Box<dyn std::error::Error>> {
-    let new_db = ensure_temp_dir_for_test_db_target_path_buffer();
-    let new_db_path = new_db.to_str().unwrap();
+async fn rusqlite() -> anyhow::Result<()> {
+    let new_db = NamedTempFile::new()?;
+    let db_path: &str = new_db.as_ref().as_os_str().try_into()?;
     let conn = rusqlite::Connection::open_in_memory().unwrap();
 
     tracing::info!(name = "Creating table and inserting data", CREATE_TABLE);
@@ -133,15 +171,15 @@ async fn rusqlite() -> Result<(), Box<dyn std::error::Error>> {
 
     assert!(things.len() == 2);
 
-    tracing::info!(name = "Vacuuming into new db", new_db_path);
-    conn.execute("vacuum into $1", [new_db_path]).unwrap();
+    tracing::info!(name = "Vacuuming into new db", db_path);
+    conn.execute("vacuum into $1", [db_path]).unwrap();
 
     tracing::info!(name = "Dropping statement and connection");
     drop(statement);
     drop(conn);
 
     tracing::info!(name = "Opening new db connection to temp db path");
-    let file_conn = rusqlite::Connection::open(new_db_path).unwrap();
+    let file_conn = rusqlite::Connection::open(new_db.as_ref()).unwrap();
     let mut statement = file_conn.prepare(SELECT_ALL).unwrap();
 
     tracing::info!(name = "Selecting all data from temp db");
@@ -157,47 +195,43 @@ async fn rusqlite() -> Result<(), Box<dyn std::error::Error>> {
         .map(|r| r.unwrap())
         .collect();
 
-    assert!(stored_things.len() == 2);
+    assert_eq!(stored_things.len(), 2);
 
     tracing::info!(name = "Comparing stored rows with original rows");
-    assert!(stored_things == things);
+    assert_eq!(stored_things, things);
 
     Ok(())
 }
 
 #[traced_test]
 #[tokio::test]
-async fn test_rusqlite() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_rusqlite() -> anyhow::Result<()> {
     rusqlite().await
 }
 
 #[traced_test]
 #[tokio::test]
-async fn test_sqlx_with_pools() -> Result<(), Box<dyn std::error::Error>> {
-    assert!(sqlx_with_pooled_connection().await?);
+async fn test_sqlx_with_pools() -> anyhow::Result<()> {
+    sqlx_with_pooled_connection().await?;
 
     Ok(())
 }
 
 #[traced_test]
 #[tokio::test]
-async fn test_sqlx_with_shared_cache_connection() -> Result<(), Box<dyn std::error::Error>> {
-    assert!(sqlx_with_shared_cache_connection().await?);
+async fn test_sqlx_with_shared_cache_connection() -> anyhow::Result<()> {
+    sqlx_with_shared_cache_connection().await?;
 
     Ok(())
 }
 
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| DEFAULT_ENV_FILTER.into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
 
-    let _ = sqlx_with_pooled_connection().await;
-    let _ = sqlx_with_shared_cache_connection().await;
-    let _ = rusqlite().await;
+    sqlx_with_pooled_connection().await?;
+    sqlx_with_shared_cache_connection().await?;
+    rusqlite().await?;
+
+    Ok(())
 }
