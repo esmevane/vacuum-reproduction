@@ -1,6 +1,5 @@
-use std::{fmt::Debug, str::FromStr};
-
 use sqlx::{ConnectOptions, Executor};
+use std::{fmt::Debug, path::PathBuf, str::FromStr};
 use tempfile::NamedTempFile;
 use tracing_test::traced_test;
 
@@ -10,7 +9,7 @@ static CREATE_TABLE: &str = r#"
   insert into test (name) values ('world');
 "#;
 
-static SELECT_ALL: &str = "select * from test";
+static SELECT_ALL: &str = "select * from test;";
 
 #[derive(Debug, sqlx::FromRow, PartialEq, Eq)]
 struct Test {
@@ -25,7 +24,7 @@ struct Table {
 
 #[tracing::instrument(level = "debug", name = "Creating vacuum statement")]
 fn vacuum_into(db_str: &str) -> String {
-    dbg!(format!("vacuum into '{db_str}'"))
+    dbg!(format!("vacuum into '{db_str}';"))
 }
 
 #[tracing::instrument(level = "debug", name = "Running sqlx with shared cache connection")]
@@ -110,7 +109,7 @@ async fn sqlx_with_pooled_connection() -> anyhow::Result<()> {
     let vacuum_statement = vacuum_into(db_path);
 
     tracing::info!(name = "Vacuuming into new db", path = db_path);
-    pool.execute(vacuum_statement.as_ref()).await?;
+    dbg!(pool.execute(vacuum_statement.as_ref()).await)?;
 
     tracing::info!(name = "Dropping pool");
     drop(pool);
@@ -120,12 +119,18 @@ async fn sqlx_with_pooled_connection() -> anyhow::Result<()> {
     assert!(new_db.as_ref().exists());
 
     tracing::info!(name = "Opening new db connection to temp db path");
-    let pool = sqlx::sqlite::SqlitePool::connect(db_path).await?;
+    let temp_connect_options =
+        sqlx::sqlite::SqliteConnectOptions::from_str(&format!("{db_path}?mode=rwc"))?
+            .shared_cache(true);
+    let temp_path = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(temp_connect_options)
+        .await?;
 
     tracing::info!(name = "Checking if tables exist");
     let tables = dbg!(
         sqlx::query_as::<_, Table>("SELECT name FROM sqlite_master WHERE type='table'")
-            .fetch_all(&pool)
+            .fetch_all(&temp_path)
             .await?
     );
 
@@ -135,7 +140,7 @@ async fn sqlx_with_pooled_connection() -> anyhow::Result<()> {
 
     tracing::info!(name = "Selecting all data from temp db");
     let stored_things = sqlx::query_as::<_, Test>(SELECT_ALL)
-        .fetch_all(&pool)
+        .fetch_all(&temp_path)
         .await?;
 
     assert_eq!(stored_things.len(), 2);
@@ -229,9 +234,83 @@ async fn test_sqlx_with_shared_cache_connection() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    sqlx_with_pooled_connection().await?;
-    sqlx_with_shared_cache_connection().await?;
-    rusqlite().await?;
+    // sqlx_with_pooled_connection().await?;
+    // sqlx_with_shared_cache_connection().await?;
+    // rusqlite().await?;
+    reproduce_vacuum_error("./test.db").await?;
+
+    Ok(())
+}
+
+#[tracing::instrument(level = "debug", name = "Invoking sqlx with named location")]
+async fn reproduce_vacuum_error(db_path: &str) -> anyhow::Result<()> {
+    // let backup_db = sqlx::sqlite::SqliteConnectOptions::from_str(db_path)?
+    //     .create_if_missing(true)
+    //     .connect()
+    //     .await?;
+
+    // drop(backup_db);
+
+    tracing::info!(name = "Creating connection with shared cache");
+    // let options =
+    //     dbg!(sqlx::sqlite::SqliteConnectOptions::from_str(":memory:"))?.shared_cache(false);
+    let options = dbg!(sqlx::sqlite::SqliteConnectOptions::from_str(""))?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+
+    tracing::info!(name = "Creating table and inserting data", CREATE_TABLE);
+    sqlx::query(CREATE_TABLE).execute(&pool).await?;
+
+    tracing::info!(name = "Selecting all data from memory table", SELECT_ALL);
+    let things = sqlx::query_as::<_, Test>(SELECT_ALL)
+        .fetch_all(&pool)
+        .await?;
+
+    assert_eq!(things.len(), 2);
+
+    tracing::info!(name = "Vacuuming into new db", path = db_path);
+    sqlx::query(&vacuum_into(db_path)).execute(&pool).await?;
+    // pool.execute(vacuum_into(db_path).as_ref()).await?;
+
+    tracing::info!(name = "Dropping connection");
+    drop(pool);
+
+    tracing::info!(name = "Checking if new db exists");
+    assert!(PathBuf::from(db_path).exists());
+
+    let backup_db_options =
+        sqlx::sqlite::SqliteConnectOptions::from_str(db_path)?.create_if_missing(true);
+    let backup_db_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(backup_db_options)
+        .await?;
+
+    tracing::info!(name = "Checking if tables exist");
+    let tables = dbg!(
+        sqlx::query_as::<_, Table>("SELECT name FROM sqlite_master WHERE type='table'")
+            .fetch_all(&backup_db_pool)
+            .await?
+    );
+
+    tracing::info!(name = "Current tables", ?tables);
+
+    assert!(tables.len() >= 1, "No tables found in new db");
+
+    tracing::info!(name = "Selecting all data from temp db");
+
+    let stored_things = sqlx::query_as::<_, Test>(SELECT_ALL)
+        .fetch_all(&backup_db_pool)
+        .await?;
+
+    assert_eq!(stored_things.len(), 2);
+
+    tracing::info!(name = "Comparing stored rows with original rows");
+    assert_eq!(stored_things, things);
+
+    // delete the file
+    std::fs::remove_file(db_path)?;
 
     Ok(())
 }
